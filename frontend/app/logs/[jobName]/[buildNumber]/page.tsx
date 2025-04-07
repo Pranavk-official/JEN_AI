@@ -25,14 +25,25 @@ export default function LogPage({ params }: LogPageProps) {
   const [error, setError] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const toast = useToast();
+  const { jobName, buildNumber } = params;
 
   useEffect(() => {
+    // Ensure buildNumber is valid before connecting
+    if (!buildNumber || buildNumber === 'undefined') {
+      setError('Invalid build number.');
+      return;
+    }
+
     const connectWebSocket = () => {
-      const ws = new WebSocket(
-        `${process.env.NEXT_PUBLIC_API_URL?.replace('http', 'ws')}/ws/logs/${params.jobName}/${params.buildNumber}`
-      );
+      // Construct the absolute WebSocket URL for the backend
+      const backendApiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+      const wsUrl = `${backendApiUrl.replace(/^http/, 'ws')}/ws/logs/${jobName}/${buildNumber}`;
+      console.log('Connecting to WebSocket:', wsUrl); // Debug log
+
+      const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
+        console.log('WebSocket connected');
         setConnected(true);
         setError(null);
       };
@@ -41,9 +52,11 @@ export default function LogPage({ params }: LogPageProps) {
         try {
           const data = JSON.parse(event.data);
           if (data.error) {
+            console.error('WebSocket received error:', data.error);
             setError(data.error);
             ws.close();
           } else if (data.status) {
+            console.log('WebSocket received status:', data.status);
             toast({
               title: 'Build Status',
               description: data.status,
@@ -58,13 +71,19 @@ export default function LogPage({ params }: LogPageProps) {
         }
       };
 
-      ws.onerror = (error) => {
+      ws.onerror = (event) => {
+        console.error('WebSocket connection error:', event);
         setError('WebSocket connection error');
         setConnected(false);
       };
 
-      ws.onclose = () => {
+      ws.onclose = (event) => {
+        console.log('WebSocket disconnected:', event.code, event.reason);
         setConnected(false);
+        // Optionally, display a message if the disconnection was unexpected
+        if (!event.wasClean) {
+          setError('WebSocket connection closed unexpectedly.');
+        }
       };
 
       wsRef.current = ws;
@@ -72,19 +91,23 @@ export default function LogPage({ params }: LogPageProps) {
 
     connectWebSocket();
 
+    // Cleanup function: Close WebSocket when component unmounts or params change
     return () => {
       if (wsRef.current) {
+        console.log('Closing WebSocket connection.');
         wsRef.current.close();
+        wsRef.current = null;
       }
     };
-  }, [params.jobName, params.buildNumber, toast]);
+    // Add jobName and buildNumber as dependencies
+  }, [jobName, buildNumber, toast]);
 
   return (
     <Container maxW="container.xl" py={8}>
       <VStack spacing={4} align="stretch">
         <HStack justify="space-between">
           <Heading size="lg">
-            Logs for {params.jobName} #{params.buildNumber}
+            Logs for {jobName} #{buildNumber}
           </Heading>
           <Box>
             {connected ? (

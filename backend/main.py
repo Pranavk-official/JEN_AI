@@ -1,4 +1,5 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.websockets import WebSocketState
 from fastapi.middleware.cors import CORSMiddleware
 import jenkins
 import asyncio
@@ -84,62 +85,113 @@ async def get_jobs():
 @app.websocket("/ws/logs/{job_name}/{build_number}")
 async def websocket_endpoint(websocket: WebSocket, job_name: str, build_number: int):
     await websocket.accept()
+    print(f"DEBUG: WebSocket accepted for {job_name} #{build_number}")
     if not server:
+        print("DEBUG: Jenkins server connection failed, closing WebSocket.")
         await websocket.send_json({"error": "Jenkins server connection failed"})
         await websocket.close()
         return
 
     try:
-        print(f"Attempting to get logs for job '{job_name}', build #{build_number}")
+        print(f"DEBUG: Attempting to get logs for job '{job_name}', build #{build_number}")
         build_info = server.get_build_info(job_name, build_number)
         is_building = build_info.get('building', False)
         start_offset = 0
+        print(f"DEBUG: Initial build status: is_building={is_building}")
+        print(f"DEBUG: Initial build_info: {build_info}")
 
         while is_building:
+            print(f"DEBUG: Loop start: Fetching logs, current offset={start_offset}")
             log_output = server.get_build_console_output(job_name, build_number)
+            print(f"DEBUG: Fetched log_output length={len(log_output) if log_output else 0}")
             if log_output:
                  # Send only new logs
                 new_log = log_output[start_offset:]
                 if new_log:
-                    await websocket.send_text(new_log)
+                    print(f"DEBUG: Sending new_log chunk, length={len(new_log)}")
+                    if websocket.client_state == WebSocketState.CONNECTED:
+                        print(f"DEBUG: WebSocket state is CONNECTED, sending text.")
+                        await websocket.send_text(new_log)
+                    else:
+                        print(f"DEBUG: WebSocket state is {websocket.client_state}, cannot send text. Breaking loop.")
+                        break
                     start_offset = len(log_output)
+                    print(f"DEBUG: Sent chunk, new offset={start_offset}")
+                else:
+                    print("DEBUG: No new logs since last check.")
 
             # Check if the build is still running
+            print("DEBUG: Checking if build is still running...")
             build_info = server.get_build_info(job_name, build_number)
             is_building = build_info.get('building', False)
+            print(f"DEBUG: Updated build status: is_building={is_building}")
+            print(f"DEBUG: Updated build_info: {build_info}")
             if not is_building:
-                print(f"Build '{job_name}' #{build_number} finished.")
+                print(f"DEBUG: Build '{job_name}' #{build_number} finished within loop.")
                 # Send any remaining logs
                 final_log_output = server.get_build_console_output(job_name, build_number)
+                print(f"DEBUG: Fetched final log_output after build finish (in loop), length={len(final_log_output) if final_log_output else 0}")
                 if final_log_output and len(final_log_output) > start_offset:
-                     await websocket.send_text(final_log_output[start_offset:])
+                     final_chunk = final_log_output[start_offset:]
+                     print(f"DEBUG: Sending final log chunk (from loop), length={len(final_chunk)}")
+                     if websocket.client_state == WebSocketState.CONNECTED:
+                         print(f"DEBUG: WebSocket state is CONNECTED, sending final text (loop).")
+                         await websocket.send_text(final_chunk)
+                     else:
+                         print(f"DEBUG: WebSocket state is {websocket.client_state}, cannot send final text (loop).")
                 break
+            print(f"DEBUG: Sleeping for 2 seconds...")
             await asyncio.sleep(2) # Poll every 2 seconds
 
-        # Send final status if build finished while polling wasn't active
+        # This section runs if the build was already finished *before* the loop started,
+        # or after the loop finishes.
+        print(f"DEBUG: Loop finished or was skipped. is_building={is_building}, start_offset={start_offset}")
         final_log_output = server.get_build_console_output(job_name, build_number)
+        print(f"DEBUG: Fetched final log_output (outside loop), length={len(final_log_output) if final_log_output else 0}")
         if final_log_output and len(final_log_output) > start_offset:
-            await websocket.send_text(final_log_output[start_offset:])
-        await websocket.send_json({"status": "Build finished"})
+            final_chunk = final_log_output[start_offset:]
+            print(f"DEBUG: Sending final log chunk (outside loop), length={len(final_chunk)}")
+            if websocket.client_state == WebSocketState.CONNECTED:
+                print(f"DEBUG: WebSocket state is CONNECTED, sending final text (outside loop).")
+                await websocket.send_text(final_chunk)
+            else:
+                print(f"DEBUG: WebSocket state is {websocket.client_state}, cannot send final text (outside loop).")
+        else:
+            print("DEBUG: No final logs to send (outside loop).")
+        print("DEBUG: Sending final status JSON: {'status': 'Build finished'}")
+        if websocket.client_state == WebSocketState.CONNECTED:
+            print(f"DEBUG: WebSocket state is CONNECTED, sending final JSON.")
+            await websocket.send_json({"status": "Build finished"})
+        else:
+            print(f"DEBUG: WebSocket state is {websocket.client_state}, cannot send final JSON.")
 
     except jenkins.NotFoundException:
-        print(f"Build '{job_name}' #{build_number} not found.")
+        print(f"ERROR: Build '{job_name}' #{build_number} not found.")
         await websocket.send_json({"error": f"Build '{job_name}' #{build_number} not found."})
     except jenkins.JenkinsException as e:
-        print(f"Jenkins API error: {e}")
+        print(f"ERROR: Jenkins API error: {e}")
         await websocket.send_json({"error": f"Jenkins API error: {e}"})
     except WebSocketDisconnect:
-        print(f"Client disconnected from log stream for '{job_name}' #{build_number}")
+        print(f"INFO: Client disconnected from log stream for '{job_name}' #{build_number}")
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        await websocket.send_json({"error": "An unexpected error occurred"})
+        print(f"ERROR: An unexpected error occurred: {e}")
+        # It's safer to check if the websocket is still connected before sending
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.send_json({"error": "An unexpected error occurred"})
     finally:
+        print("DEBUG: Entering finally block.")
         try:
-            await websocket.close()
+            # Ensure websocket state allows closing before attempting
+            if websocket.client_state == WebSocketState.CONNECTED:
+                 print("DEBUG: Closing WebSocket connection.")
+                 await websocket.close()
+            else:
+                 print(f"DEBUG: WebSocket already closed or in invalid state ({websocket.client_state}), skipping close.")
         except RuntimeError as e:
             # Ignore errors if the connection is already closed
             if "Cannot call 'close'" not in str(e):
-                 print(f"Error closing websocket: {e}")
+                 print(f"ERROR: Error closing websocket: {e}")
+        print("DEBUG: Exiting websocket_endpoint.")
 
 if __name__ == "__main__":
     import uvicorn
