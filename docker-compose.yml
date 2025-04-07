@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - JENKINS_URL=${JENKINS_URL_FROM_HOST}
+      - JENKINS_USERNAME=${JENKINS_USERNAME_FROM_HOST}
+      - JENKINS_PASSWORD=${JENKINS_PASSWORD_FROM_HOST}
+      - JENKINS_CRUMB_DISABLED=true
+    networks:
+      - app-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
